@@ -45,17 +45,22 @@ func (rh *RequestHandler) Do(req *http.Request) (*http.Response, error) {
 	return rh.DoWeighted(req, 1)
 }
 
-//Tries to acquire semaphore using the given weight, then runs the request on the http client
+//Tries to acquire semaphore using the given weight and default timeout, then runs the request on the http client
 func (rh *RequestHandler) DoWeighted(req *http.Request, weight int) (*http.Response, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), rh.timeout)
+	defer cancel()
+	return rh.DoWeightedContext(req, weight, ctx)
+}
+
+//Tries to acquire semaphore using the given weight and context, then runs the request on the http client
+func (rh *RequestHandler) DoWeightedContext(req *http.Request, weight int, ctx context.Context) (*http.Response, error) {
 	if req == nil {
 		return nil, errors.New("Request is nil")
 	}
 	if err := rh.checkStruct(); err != nil {
 		return nil, err
 	}
-	wait, cancel := context.WithTimeout(context.Background(), rh.timeout)
-	defer cancel()
-	if err := rh.sem.Acquire(wait, int64(weight)); err != nil {
+	if err := rh.sem.Acquire(ctx, int64(weight)); err != nil {
 		return nil, err
 	}
 	defer rh.sem.Release(int64(weight))
