@@ -1,0 +1,8 @@
+Add check to make sure weight isnt negative
+switch to int64 everywhere?
+add verification to requests
+ability to inject into requests
+track network errors?
+use custom conns to track data usage
+testing
+determine costs of counters
