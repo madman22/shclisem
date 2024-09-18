@@ -3,6 +3,8 @@ package shclisem
 import (
 	"context"
 	"errors"
+	"net/url"
+	"sort"
 
 	"math"
 	"net/http"
@@ -21,6 +23,7 @@ Simple HTTP Client Semaphore
 
 For limiting concurrent client connections using weighting.  Use the NewRequestHandler function to build the struct.
 */
+
 type RequestHandler struct {
 	client  *http.Client
 	sem     *semaphore.Weighted
@@ -29,6 +32,8 @@ type RequestHandler struct {
 	waiting *counter
 	total   *counter
 	errs    *counter
+	inflight map[string]struct{}
+	inflightmux sync.RWMutex
 }
 
 type counter struct {
@@ -128,11 +133,51 @@ func (rh *RequestHandler) DoWeighted(req *http.Request, weight int) (*http.Respo
 	return rh.DoWeightedContext(req, weight, ctx)
 }
 
+func (rh *RequestHandler) addInFlight(url *url.URL) {
+	rh.inflightmux.Lock()
+	defer rh.inflightmux.Unlock()
+	if rh.inflight == nil {
+		rh.inflight = make(map[string]struct{})
+	}
+	rh.inflight[url.String()] = struct{}{}
+}
+
+func (rh *RequestHandler) removeInFlight(url *url.URL) {
+	rh.inflightmux.Lock()
+	defer rh.inflightmux.Unlock()
+	if rh.inflight == nil {
+		return
+	}
+	delete(rh.inflight, url.String())
+}
+
+
+//Returns the URL strings of the in flight requests
+func (rh *RequestHandler) InFlight() []string {
+	rh.inflightmux.RLock()
+	if rh.inflight == nil {
+		rh.inflightmux.RUnlock()
+		return []string{}
+	}
+	var out []string
+	for u := range rh.inflight {
+		out = append(out, u)
+	}
+	rh.inflightmux.RUnlock()
+	sort.Strings(out)
+	return out
+}
+
 //Tries to acquire semaphore using the given weight and context, then runs the request on the http client
 func (rh *RequestHandler) DoWeightedContext(req *http.Request, weight int, ctx context.Context) (*http.Response, error) {
 	if req == nil {
 		return nil, errors.New("Request is nil")
 	}
+
+	u := req.URL
+	rh.addInFlight(u)
+	defer rh.removeInFlight(u)
+	
 	if weight < 1 {
 		weight = 1
 	}
