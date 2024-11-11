@@ -25,14 +25,15 @@ For limiting concurrent client connections using weighting.  Use the NewRequestH
 */
 
 type RequestHandler struct {
-	client  *http.Client
-	sem     *semaphore.Weighted
-	timeout time.Duration
-	current *counter
-	waiting *counter
-	total   *counter
-	errs    *counter
-	inflight map[string]struct{}
+	client      *http.Client
+	sem         *semaphore.Weighted
+	maxweight   int
+	timeout     time.Duration
+	current     *counter
+	waiting     *counter
+	total       *counter
+	errs        *counter
+	inflight    map[string]struct{}
 	inflightmux sync.RWMutex
 }
 
@@ -94,7 +95,7 @@ func (c *counter) Max() int {
 	return c.max
 }
 
-//Creates new RequestHandler with the given total weight, per item wait timeout, and http client, or the default http client if nil
+// Creates new RequestHandler with the given total weight, per item wait timeout, and http client, or the default http client if nil
 func NewRequestHandler(tweight int, timeout time.Duration, cli *http.Client) *RequestHandler {
 	var rh RequestHandler
 	if tweight < 1 {
@@ -102,6 +103,7 @@ func NewRequestHandler(tweight int, timeout time.Duration, cli *http.Client) *Re
 	} else if tweight > math.MaxInt32 {
 		tweight = math.MaxInt32
 	}
+	rh.maxweight = tweight
 	rh.sem = semaphore.NewWeighted(int64(tweight))
 	if timeout < 1*time.Second { //check to make sure the timeout isn't too short
 		timeout = 1 * time.Minute //set the default value for the per item timeout, 1 minute
@@ -121,12 +123,12 @@ func NewRequestHandler(tweight int, timeout time.Duration, cli *http.Client) *Re
 	return &rh
 }
 
-//Tries to acquire semaphore using weight of 1 and default timeout, then runs the request on the http client
+// Tries to acquire semaphore using weight of 1 and default timeout, then runs the request on the http client
 func (rh *RequestHandler) Do(req *http.Request) (*http.Response, error) {
 	return rh.DoWeighted(req, 1)
 }
 
-//Tries to acquire semaphore using the given weight and default timeout, then runs the request on the http client
+// Tries to acquire semaphore using the given weight and default timeout, then runs the request on the http client
 func (rh *RequestHandler) DoWeighted(req *http.Request, weight int) (*http.Response, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), rh.timeout)
 	defer cancel()
@@ -151,8 +153,7 @@ func (rh *RequestHandler) removeInFlight(url *url.URL) {
 	delete(rh.inflight, url.String())
 }
 
-
-//Returns the URL strings of the in flight requests
+// Returns the URL strings of the in flight requests
 func (rh *RequestHandler) InFlight() []string {
 	rh.inflightmux.RLock()
 	if rh.inflight == nil {
@@ -168,7 +169,7 @@ func (rh *RequestHandler) InFlight() []string {
 	return out
 }
 
-//Tries to acquire semaphore using the given weight and context, then runs the request on the http client
+// Tries to acquire semaphore using the given weight and context, then runs the request on the http client
 func (rh *RequestHandler) DoWeightedContext(req *http.Request, weight int, ctx context.Context) (*http.Response, error) {
 	if req == nil {
 		return nil, errors.New("Request is nil")
@@ -177,12 +178,16 @@ func (rh *RequestHandler) DoWeightedContext(req *http.Request, weight int, ctx c
 	u := req.URL
 	rh.addInFlight(u)
 	defer rh.removeInFlight(u)
-	
+
 	if weight < 1 {
 		weight = 1
+	} else if weight > rh.maxweight {
+		weight = rh.maxweight
 	}
 	if ctx == nil {
-		ctx = context.Background()
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(context.Background(), rh.timeout)
+		defer cancel()
 	}
 	if err := rh.checkStruct(); err != nil {
 		return nil, err
@@ -191,7 +196,7 @@ func (rh *RequestHandler) DoWeightedContext(req *http.Request, weight int, ctx c
 		return nil, err
 	}
 	if err := rh.sem.Acquire(ctx, int64(weight)); err != nil {
-		if errr := rh.waiting.Remove(); err != nil {
+		if errr := rh.waiting.Remove(); errr != nil {
 			return nil, errors.New(errr.Error() + " & " + err.Error())
 		}
 		return nil, err
@@ -205,17 +210,21 @@ func (rh *RequestHandler) DoWeightedContext(req *http.Request, weight int, ctx c
 	}
 	resp, err := rh.client.Do(req)
 	if errr := rh.current.Remove(); errr != nil {
-		rh.errs.Add()
-		return nil, errors.New(errr.Error() + " & " + err.Error())
+		return nil, errr
 	}
 	if err != nil {
+		if errr := rh.errs.Add(); errr != nil {
+			return nil, errr
+		}
 		return nil, err
 	}
-	rh.total.Add()
+	if err := rh.total.Add(); err != nil {
+		return nil, err
+	}
 	return resp, nil
 }
 
-//Returns the amount of weight waiting for the semaphore
+// Returns the amount of weight waiting for the semaphore
 func (rh *RequestHandler) GetWaitingWeight() int {
 	if rh.waiting == nil {
 		return 0
@@ -223,7 +232,7 @@ func (rh *RequestHandler) GetWaitingWeight() int {
 	return rh.waiting.Count()
 }
 
-//Returns the used weight that has aquired the semaphore
+// Returns the used weight that has aquired the semaphore
 func (rh *RequestHandler) GetCurrentWeight() int {
 	if rh.current == nil {
 		return 0
@@ -231,7 +240,7 @@ func (rh *RequestHandler) GetCurrentWeight() int {
 	return rh.current.Count()
 }
 
-//Returns the number of http request errors
+// Returns the number of http request errors
 func (rh *RequestHandler) GetErrorCount() int {
 	if rh.errs == nil {
 		return 0
@@ -239,7 +248,7 @@ func (rh *RequestHandler) GetErrorCount() int {
 	return rh.errs.Count()
 }
 
-//Returns the number of successful requests
+// Returns the number of successful requests
 func (rh *RequestHandler) GetTotalCount() int {
 	if rh.total == nil {
 		return 0
@@ -247,7 +256,7 @@ func (rh *RequestHandler) GetTotalCount() int {
 	return rh.total.Count()
 }
 
-//verifies the struct was built properly
+// verifies the struct was built properly
 func (rh *RequestHandler) checkStruct() error {
 	if rh.client == nil {
 		return errors.New("nil http client, use the function NewRequestHandler to build the RequestHandler struct")
